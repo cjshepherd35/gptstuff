@@ -1,11 +1,4 @@
-#get rid of linear nets in between self attention layers. it just makes things a little less accurate compared to 
-#the regular gpt made by ilya video. 
-#next experiment was to get rid of key values in self attention. they are 
-#matmulled so it is a linear combination and therefore useless to have an extra
-#linear piece. 
-#--findings of  this are that the model can be smaller with small context window but becomes 
-#much bigger with a larger context window unfortunately. 
-#next experiment is  to combine both
+#using lora doesnt make much difference than just using small k shareable qnet and knet it seems
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -15,16 +8,19 @@ with open('input.txt', 'r', encoding='utf-8') as f:
 print('device is: ', device)
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
-max_iters = 5000
-eval_iters = 200
-eval_interval = 500
-n_embed = 64
+print('vocab size ',vocab_size)
+#parameters to tweak
+max_iters = 5001
+eval_iters = 100
+eval_interval =  200  #500
+n_embed = 128   #64
 block_size = 64
 batch_size = 12
 learning_rate = 3e-4
-n_head = 4
-n_layer = 6
-dropout = 0.2
+n_head = 4  #4
+n_layer = 6  #6
+dropout = 0.2 
+smallk = 6
 
 stoi = {ch:i for i,ch in enumerate(chars)}
 itos = {i:ch for i,ch in enumerate(chars)}
@@ -65,20 +61,24 @@ def estimate_loss():
 
 class Head(nn.Module):
 
-    def __init__(self, head_size):
+    def __init__(self, head_size, knet, qnet):
         super().__init__()
-        # self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, block_size, bias=False)
+        self.knet = knet
+        self.qnet = qnet
+        # self.key = nn.Linear(smallk, head_size, bias=False)
+        # self.query = nn.Linear(smallk, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         b,t,c = x.shape
-        # k = self.key(x)
-        q = self.query(x)
+        # k = self.key(self.knet(x))
+        k = self.knet(x)
+        q = self.qnet(x)
+        # q = self.query(self.qnet(x))
         #compute attention scores
-        wei = q  #@ k.transpose(-2,-1) * c**-0.5
+        wei = q @ k.transpose(-2,-1) * c**-0.5
         wei = wei.masked_fill(self.tril[:t, :t] == 0, float('-inf')) #(b,t,t)
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
@@ -90,7 +90,9 @@ class Head(nn.Module):
 class MultiheadAttention(nn.Module):
     def __init__(self,num_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.knet = nn.Linear(n_embed, smallk)
+        self.qnet = nn.Linear(n_embed, smallk)
+        self.heads = nn.ModuleList([Head(head_size, self.knet, self.qnet) for _ in range(num_heads)])
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
     def forward(self, x):
@@ -118,13 +120,13 @@ class Block(nn.Module):
         self.ffwd = FeedForward(n_embed)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
-
+        
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
 
-class BigramLanguageModel(nn.Module):
+class Transformer(nn.Module):
 
     def __init__(self):
         super().__init__()
@@ -139,7 +141,7 @@ class BigramLanguageModel(nn.Module):
         b,t = idx.shape
         #idx and targets are both (b,t) tensor of integers
         token_embed = self.token_embedding_table(idx) #(b,t,c)
-        pos_embed = self.position_embedding_table(torch.arange(t, device=device))
+        pos_embed = self.position_embedding_table(torch.arange(t, device=device)) #also (b,t,c)
         x = pos_embed + token_embed
         x = self.blocks(x)
         x = self.ln_f(x)
@@ -165,10 +167,11 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-model = BigramLanguageModel()
+model = Transformer()
 total_params = sum(p.numel() for p in model.parameters())
-print(total_params)
+print('size of model',total_params)
 m = model.to(device)
+
 # logits, loss = m(xb,yb)
 optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
 

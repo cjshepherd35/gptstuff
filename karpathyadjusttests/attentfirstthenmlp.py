@@ -1,38 +1,39 @@
+#doesn't seem to work. the loss is higher than regular karpathy. even though you can make many more layers work much faster, all those extra layers seem useless. 
 import torch
-import pandas as pd
-import numpy as np
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import DistilBertTokenizerFast
-
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-df = pd.read_csv('C:/Users/cshep/Documents/datasets/IMDBDataset.csv')
-train_texts = df.iloc[:40_000]['review'].values
-train_texts = ''.join(train_texts)
-test_texts = df.iloc[40_000:]['review'].values
-test_texts = ''.join(test_texts)
-
-tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
-train_tokens = tokenizer(train_texts, truncation=False, padding=False, return_tensors='pt')
-test_tokens = tokenizer(test_texts, truncation=False, padding=False, return_tensors='pt')
-train_data = train_tokens['input_ids']
-test_data = test_tokens['input_ids']
-train_data = train_data.view(-1)
-test_data = test_data.view(-1)
-
+with open('input.txt', 'r', encoding='utf-8') as f:
+    text = f.read()
 print('device is: ', device)
-
-vocab_size = tokenizer.vocab_size
-max_iters = 10_001
-eval_iters = 200
-eval_interval = 500
-n_embed = 192
-block_size = 128
-batch_size = 64
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
+print('vocab size: ',vocab_size)
+#parameters to tweak
+max_iters = 3001
+eval_iters = 100
+eval_interval =  500  #500
+n_embed = 64   #64
+block_size = 64
+batch_size = 12
 learning_rate = 3e-4
-n_head = 8
-n_layer = 6
+n_head = 4  #4
+n_layer = 10  #6
+n_layersblocks = 3
 dropout = 0.2
+n_recursions = 2
+
+stoi = {ch:i for i,ch in enumerate(chars)}
+itos = {i:ch for i,ch in enumerate(chars)}
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: ''.join([itos[i] for i in l])
+
+data = torch.tensor(encode(text), dtype = torch.long)
+n = int(0.9*len(data))
+train_data = data[:n]
+test_data = data[n:]
+
+torch.manual_seed(1337)
 
 
 def get_batch(split):
@@ -105,6 +106,33 @@ class FeedForward(nn.Module):
         )
     def forward(self, x):
         return self.net(x)
+
+class SmallFeedForward(nn.Module):
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, n_embed//2),
+            nn.ReLU(), 
+            nn.Linear(n_embed//2, n_embed), 
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class ThinBlock(nn.Module):
+    def __init__(self, n_embed, n_head):
+        super().__init__()
+        head_size = n_embed // n_head
+        self.sa = MultiheadAttention(n_head, head_size)
+        self.sffwd = SmallFeedForward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+        
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.sffwd(x)
+
+        return x
     
 class Block(nn.Module):
     def __init__(self, n_embed, n_head):
@@ -112,33 +140,45 @@ class Block(nn.Module):
         head_size = n_embed // n_head
         self.sa = MultiheadAttention(n_head, head_size)
         self.ffwd = FeedForward(n_embed)
+        self.ffd2 = FeedForward(n_embed)
+        self.ffd3 = FeedForward(n_embed)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
-
+        self.ln3 = nn.LayerNorm(n_embed)
+        self.ln4 = nn.LayerNorm(n_embed)
+        
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
+        x = self.ffd2(self.ln3(x))
+        x = self.ffd3(self.ln4(x))
         return x
 
-class BigramLanguageModel(nn.Module):
+class Transformer(nn.Module):
 
     def __init__(self):
         super().__init__()
         #each token reads off the logits for the next tokenfrom a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed) 
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head) for _ in range(n_layer)])
+        self.tblocks = nn.Sequential(*[ThinBlock(n_embed, n_head=n_head) for _ in range(n_layer)])
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head) for _ in range(n_layersblocks)])
+        self.block = Block(n_embed, n_head)
         self.ln_f = nn.LayerNorm(n_embed) #final layer norm
+        self.ffwd = FeedForward(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size) 
 
     def forward(self, idx, targets=None):
         b,t = idx.shape
         #idx and targets are both (b,t) tensor of integers
         token_embed = self.token_embedding_table(idx) #(b,t,c)
-        pos_embed = self.position_embedding_table(torch.arange(t, device=device))
+        pos_embed = self.position_embedding_table(torch.arange(t, device=device)) #also (b,t,c)
         x = pos_embed + token_embed
+        for _ in range(n_recursions):   
+            x = self.tblocks(x)
         x = self.blocks(x)
         x = self.ln_f(x)
+        x = self.ffwd(x)
         logits = self.lm_head(x)
 
         if targets is None:
@@ -161,8 +201,11 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-model = BigramLanguageModel()
+model = Transformer()
+total_params = sum(p.numel() for p in model.parameters())
+print('size of model',total_params)
 m = model.to(device)
+
 # logits, loss = m(xb,yb)
 optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
 
@@ -174,7 +217,7 @@ for iter in range(max_iters):
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
     #sample batch of data
     xb, yb = get_batch('train')
-
+    
     #evaluate loss
     logits, loss = m(xb, yb)
     optimizer.zero_grad(set_to_none=True)
@@ -182,8 +225,5 @@ for iter in range(max_iters):
     optimizer.step()
 
 
-# context = idx=torch.zeros((1,1), dtype=torch.long, device=device)
-wordcontext = 'this movie is horrible'
-context = tokenizer(wordcontext, truncation=False,  padding=False, return_tensors='pt')['input_ids']
-context = context.to(device)
-print(tokenizer.decode(m.generate(context, max_new_tokens=200)[0].tolist()))
+context = idx=torch.zeros((1,1), dtype=torch.long, device=device)
+print(decode(m.generate(context, max_new_tokens=200)[0].tolist()))

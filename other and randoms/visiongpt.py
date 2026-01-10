@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 VIDEO_DIR = 'C:/Users/cshep/Documents/datasets/videotraffic/video' #os.path.join('Users/cshep/Documents/datasets', 'video' )
 freqs = 2_000
@@ -46,12 +46,12 @@ test_movs = torch.FloatTensor(sfftmovs[200:])
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print('device is: ', device)
 vocab_size = freqs*2
-max_iters = 10_000
+max_iters = 2_000
 # eval_iters = 200
-eval_interval = 400
+eval_interval = 50
 n_embed = freqs*2
 block_size = 10
-batch_size = 3
+batch_size = 8
 learning_rate = 3e-4
 n_head = 4
 n_layer = 4
@@ -149,14 +149,24 @@ class BigramLanguageModel(nn.Module):
             targets = targets.view(b*t, c)
             loss = F.mse_loss(logits, targets)
         return logits, loss
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            # crop idx to the  last block_size tokens
+            idx_cond = idx[:, -block_size:]
+            logits, loss = self(idx_cond)
+            logits = logits[:,-1,:]
+            # probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(logits, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
     
 model = BigramLanguageModel()
 m = model.to(device)
 # xb, yb = get_batch('train')
 # logits, loss = m(xb,yb)
-# print('x ', xb.shape)
+# # print('x ', xb.shape)
 # logits= logits.view(batch_size, block_size,  freqs*2)
-# print(logits.shape)
+# # print(logits.shape)
 
 optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
 
@@ -168,10 +178,20 @@ for iter in range(max_iters):
     #evaluate loss
     logits, loss = m(xb, yb)
     if not iter % eval_interval:
-        print('step ', iter, ' loss ', loss)
+        print('step ', iter, ' loss ', loss.item())
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+logits = m.generate(xb, 1)
+
+outfimg = logits[0,-1,:].cpu()
+outfimg = outfimg.detach().numpy()
+outfimg = outfimg[:freqs] + outfimg[freqs:]*1j
+outfimg = np.append(outfimg, np.zeros(57600-outfimg.shape[0]))
+img = np.fft.ifft(outfimg).real
+img = img.reshape(240,240)
+img = pd.DataFrame(img)
+img.to_csv('img.csv')
 
 
 

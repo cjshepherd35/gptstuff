@@ -7,17 +7,18 @@ with open('input.txt', 'r', encoding='utf-8') as f:
 print('device is: ', device)
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
+print(vocab_size)
 #parameters to tweak
-max_iters = 5000
-eval_iters = 200
-eval_interval = 500
-n_embed = 64
+max_iters = 3001
+eval_iters = 100
+eval_interval =  500  #500
+n_embed = 64   #64
 block_size = 64
 batch_size = 12
 learning_rate = 3e-4
-n_head = 4
-n_layer = 6
-dropout = 0.2
+n_head = 4  #4
+n_layer = 6  #6
+dropout = 0.2 
 
 stoi = {ch:i for i,ch in enumerate(chars)}
 itos = {i:ch for i,ch in enumerate(chars)}
@@ -91,33 +92,85 @@ class MultiheadAttention(nn.Module):
         out = self.dropout(self.proj(out))
         return out
 
-class FeedForward(nn.Module):
-    def __init__(self, n_embed):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embed, 4*n_embed),
-            nn.ReLU(), 
-            nn.Linear(4*n_embed, n_embed), 
-            nn.Dropout(dropout)
-        )
-    def forward(self, x):
-        return self.net(x)
+class RandomizingMLP(nn.Module):
+    def __init__(self, n_embed=64, randomize_ratio=0.01):
+        super(RandomizingMLP, self).__init__()
+        
+        self.randomize_ratio = randomize_ratio  # e.g., 1% of weights
+
+        # Define layers with parameters
+        self.fc1 = nn.Linear(n_embed, 2*n_embed)
+        self.fc2 = nn.Linear(2*n_embed, n_embed)
+
+        # Register all parameters for easy access
+        self._params = list(self.fc1.parameters()) + list(self.fc2.parameters())
+
+    def randomize_weights(self):
+        """
+        Randomly reinitialize a small percentage of weights.
+        This operation is detached from the gradient graph.
+        """
+        if self.randomize_ratio <= 0:
+            return
+
+        with torch.no_grad():  # Crucial: no gradients through randomization
+            total_elements = sum(p.numel() for p in self._params)
+            num_to_randomize = max(1, int(total_elements * self.randomize_ratio))
+
+            # Flatten all parameters into a single view
+            flat_params = torch.cat([p.view(-1) for p in self._params])
+
+            # Randomly select indices to randomize
+            global_idx = torch.randperm(flat_params.numel())[:num_to_randomize]
+
+            # Generate random values (same init as Xavier/Glorot for fairness)
+            # You can change initialization as needed
+            bound = (6 / (2*n_embed)) ** 0.5  # rough bound
+            new_vals = torch.empty(num_to_randomize, device=self._params[0].device).uniform_(-bound, bound)
+            # Apply randomization in-place
+            # flat_params[global_idx] = random_values
+
+            # Scatter back into original parameter tensors
+            cur = 0
+            new_val_ptr = 0
+            for p in self._params:
+                flat = p.view(-1)
+                sz = flat.numel()
+
+                # which of the global indices belong to this parameter?
+                mask = (global_idx >= cur) & (global_idx < cur + sz)
+                if mask.any():
+                    local_idx = global_idx[mask] - cur          # indices inside this param
+                    flat[local_idx] = new_vals[new_val_ptr:new_val_ptr + mask.sum()]
+                    new_val_ptr += mask.sum()
+
+                cur += sz
+    def forward(self, x, randomize=True):
+        """
+        Forward pass with optional weight randomization.
+        """
+        if randomize and self.training:
+            self.randomize_weights()  # Randomize before forward
+
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
     
 class Block(nn.Module):
     def __init__(self, n_embed, n_head):
         super().__init__()
         head_size = n_embed // n_head
         self.sa = MultiheadAttention(n_head, head_size)
-        self.ffwd = FeedForward(n_embed)
+        self.ffwd = RandomizingMLP(n_embed, randomize_ratio=0.05)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
-
+        
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
 
-class BigramLanguageModel(nn.Module):
+class Transformer(nn.Module):
 
     def __init__(self):
         super().__init__()
@@ -132,7 +185,7 @@ class BigramLanguageModel(nn.Module):
         b,t = idx.shape
         #idx and targets are both (b,t) tensor of integers
         token_embed = self.token_embedding_table(idx) #(b,t,c)
-        pos_embed = self.position_embedding_table(torch.arange(t, device=device))
+        pos_embed = self.position_embedding_table(torch.arange(t, device=device)) #also (b,t,c)
         x = pos_embed + token_embed
         x = self.blocks(x)
         x = self.ln_f(x)
@@ -158,9 +211,9 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-model = BigramLanguageModel()
+model = Transformer()
 total_params = sum(p.numel() for p in model.parameters())
-print(total_params)
+print('size of model',total_params)
 m = model.to(device)
 
 # logits, loss = m(xb,yb)
