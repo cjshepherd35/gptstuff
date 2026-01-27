@@ -1,4 +1,4 @@
-#this really seems to work, needs further research
+#at this level seems same as just doing one static subset
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -8,7 +8,7 @@ with open('input.txt', 'r', encoding='utf-8') as f:
 print('device is: ', device)
 
 #parameters to tweak
-max_iters = 5_001
+max_iters = 6_001
 eval_iters = 100
 eval_interval =  500  #200
 n_embed = 128   #64
@@ -18,7 +18,7 @@ learning_rate = 3e-4
 n_head = 8  #4
 n_layer = 8  #6
 dropout = 0.2 
-update_ratio = 0.6
+update_ratio = 0.3
 
 vocab_size = 1100 #my own preset number, may need changing
 num_merges = vocab_size - 256 #256 is how many distinct utf-8 tokens there are.
@@ -75,47 +75,41 @@ test_data = data[n:]
 torch.manual_seed(1337)
 # print(train_data[:50])
 
-
-# --- 2. The Core Masking Function ---
-def apply_random_weight_mask(layer: nn.Module, update_ratio: float):
+def initialize_dual_masks(model, update_ratio):
     """
-    Applies a random binary mask to the gradient of the weight parameter
-    of a linear layer, ensuring only a subset of weights get updated.
-
-    Note: This only masks the weight gradients, not the bias gradients.
+    Registers two independent random masks for every Linear layer.
     """
-    # if isinstance(layer, nn.Linear):
-        # Check if the gradient exists (i.e., backward pass has run)
-    if layer.weight.grad is not None:
-        # Get the total number of elements in the weight tensor
-        num_weights = layer.weight.numel()
-        
-        # Calculate the number of weights to be updated (non-zero in the mask)
-        num_to_update = int(num_weights * update_ratio)
-        
-        # Create a 1D tensor of indices [0, 1, 2, ..., num_weights-1]
-        # indices = torch.arange(num_weights)
-        
-        # Randomly permute the indices
-        permuted_indices = torch.randperm(num_weights)
-        
-        # Select the indices corresponding to the weights to be updated
-        update_indices = permuted_indices[:num_to_update]
-        
-        # Create a full mask initialized to 0s
-        mask_1d = torch.zeros(num_weights, device=layer.weight.device)
-        
-        # Set the values at the selected indices to 1
-        mask_1d[update_indices] = 1.0
-        
-        # Reshape the 1D mask to match the layer's weight tensor shape
-        mask = mask_1d.view_as(layer.weight)
-        
-        # Apply the mask: zero out the gradients for the non-selected weights
-        layer.weight.grad.data.mul_(mask)
-
-
-
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if 'heads' in name:
+                num_weights = module.weight.numel()
+                num_to_update = int(num_weights * update_ratio)
+                
+                # Create first mask
+                mask1_1d = torch.zeros(num_weights)
+                indices1 = torch.randperm(num_weights)[:num_to_update]
+                mask1_1d[indices1] = 1.0
+                
+                # Create second mask (independent random subset)
+                mask2_1d = torch.zeros(num_weights)
+                indices2 = torch.randperm(num_weights)[:num_to_update]
+                mask2_1d[indices2] = 1.0
+                
+                # Register both as buffers
+                module.register_buffer('weight_mask_1', mask1_1d.view_as(module.weight))
+                module.register_buffer('weight_mask_2', mask2_1d.view_as(module.weight))
+            
+def apply_dual_masks(model, use_second_set=False):
+    """
+    Applies either mask_1 or mask_2 depending on the phase.
+    """
+    mask_name = 'weight_mask_2' if use_second_set else 'weight_mask_1'
+    
+    for module in model.modules():
+        if isinstance(module, nn.Linear) and hasattr(module, mask_name):
+            if module.weight.grad is not None:
+                mask = getattr(module, mask_name)
+                module.weight.grad.data.mul_(mask)
 
 def get_batch(split):
     #generate a small batch of data of inputs x and y
@@ -246,6 +240,7 @@ class Transformer(nn.Module):
         return idx
 
 model = Transformer()
+initialize_dual_masks(model, update_ratio)
 total_params = sum(p.numel() for p in model.parameters())
 print('size of model',total_params)
 m = model.to(device)
@@ -266,24 +261,6 @@ for iter in range(max_iters):
     logits, loss = m(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    # 4. **Selective Gradient Masking**
-    # We use model.named_modules() to find the specific layer(s)
-    #this code if we want to only access certain named layers
-
-    # for name, module in model.named_modules():
-    #     # Target the specific layer by its name (e.g., 'key')
-    #     # print(name)
-    #     if name == 'lm_head':
-    #         apply_random_weight_mask(module, update_ratio)
-    #     if name == '':
-    #         apply_random_weight_mask(module, update_ratio)
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            if 'heads' or 'ffwd' in name:
-                apply_random_weight_mask(module, update_ratio)
+    is_second_half = iter >= max_iters // 2
+    apply_dual_masks(model, is_second_half)
     optimizer.step()
-
-
-
-# context = idx=torch.zeros((1,1), dtype=torch.long, device=device)
-# print(decode(m.generate(context, max_new_tokens=200)[0].tolist()))

@@ -9,7 +9,7 @@ with open('input.txt', 'r', encoding='utf-8') as f:
 print('device is: ', device)
 
 #parameters to tweak
-max_iters = 5_001
+max_iters = 6_001
 eval_iters = 100
 eval_interval =  500  #200
 n_embed = 128   #64
@@ -19,7 +19,7 @@ learning_rate = 3e-4
 n_head = 8  #4
 n_layer = 8  #6
 dropout = 0.2 
-update_ratio = 0.5
+update_ratio = 0.3
 
 vocab_size = 1100 #my own preset number, may need changing
 num_merges = vocab_size - 256 #256 is how many distinct utf-8 tokens there are.
